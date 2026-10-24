@@ -6,6 +6,8 @@ const authRoutes = require("./routes/auth");
 const app = express();
 const PORT = 3000;
 
+const verifyUser = require("./middleware/verify-user");
+
 app.disable("x-powered-by");
 app.use(express.json({ limit: "100kb" }));
 
@@ -17,6 +19,13 @@ app.get("/health", (req, res) => {
 });
 
 app.use("/auth", authRoutes);
+
+app.get("/me", verifyUser, (req, res) => {
+    res.json({
+        message: "Token dan device valid.",
+        user: req.user
+    });
+});
 
 app.use((req, res) => {
     res.status(404).json({
