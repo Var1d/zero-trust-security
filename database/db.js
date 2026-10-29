@@ -59,6 +59,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS refresh_tokens (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
+    device_id TEXT,
     token_hash TEXT NOT NULL UNIQUE,
     expires_at TEXT NOT NULL,
     revoked_at TEXT,
@@ -100,6 +101,49 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_audit_occurred
     ON audit_logs(occurred_at);
 `);
+
+// Additive, idempotent migration for databases created before device-bound
+// refresh sessions. A legacy session is bound only when its user has exactly
+// one active device; ambiguous sessions are revoked without deleting history.
+const refreshTokenColumns = new Set(
+  db.pragma("table_info(refresh_tokens)").map(column => column.name)
+);
+
+if (!refreshTokenColumns.has("device_id")) {
+  try {
+    db.exec("ALTER TABLE refresh_tokens ADD COLUMN device_id TEXT");
+  } catch (error) {
+    const columnsAfterAlter = new Set(
+      db.pragma("table_info(refresh_tokens)").map(column => column.name)
+    );
+    if (!columnsAfterAlter.has("device_id")) throw error;
+  }
+}
+
+const legacyRefreshTokens = db.prepare(`
+  SELECT id, user_id FROM refresh_tokens WHERE device_id IS NULL
+`).all();
+const activeDevices = db.prepare(`
+  SELECT device_id FROM devices WHERE user_id = ? AND is_active = 1
+`);
+const bindLegacyToken = db.prepare(`
+  UPDATE refresh_tokens SET device_id = ? WHERE id = ? AND device_id IS NULL
+`);
+const revokeAmbiguousToken = db.prepare(`
+  UPDATE refresh_tokens SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP)
+  WHERE id = ? AND device_id IS NULL
+`);
+const migrateLegacyTokens = db.transaction(() => {
+  for (const token of legacyRefreshTokens) {
+    const devices = activeDevices.all(token.user_id);
+    if (devices.length === 1) {
+      bindLegacyToken.run(devices[0].device_id, token.id);
+    } else {
+      revokeAmbiguousToken.run(token.id);
+    }
+  }
+});
+migrateLegacyTokens();
 
 console.log("Database berhasil diinisialisasi.");
 

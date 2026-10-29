@@ -1,5 +1,5 @@
 require("dotenv").config();
-const crypto = require("node:crypto");
+const jwt = require("jsonwebtoken");
 
 const express = require("express");
 const {
@@ -9,18 +9,116 @@ const {
 
 const authRoutes = require("./routes/auth");
 const verifyUser = require("./middleware/verify-user");
+const { evaluatePolicy } = require("./policy");
+const db = require("../database/db");
 
 const app = express();
 const PORT = 3000;
 
 const GATEWAY_SECRET = process.env.GATEWAY_SECRET;
-const SERVICE_TO_SERVICE_SECRET =
-    process.env.SERVICE_TO_SERVICE_SECRET;
+const SERVICE_CLIENT_ID = process.env.SERVICE_CLIENT_ID || "service-nilai";
+const SERVICE_CLIENT_SECRET =
+    process.env.SERVICE_CLIENT_SECRET || process.env.SERVICE_TO_SERVICE_SECRET;
+const ACCESS_SECRET = process.env.JWT_ACCESS_SECRET;
 
-if (!GATEWAY_SECRET || !SERVICE_TO_SERVICE_SECRET) {
+if (
+    !GATEWAY_SECRET ||
+    !SERVICE_CLIENT_SECRET ||
+    SERVICE_CLIENT_SECRET.trim().toLowerCase().startsWith("ganti_dengan_") ||
+    !ACCESS_SECRET
+) {
     throw new Error(
-        "GATEWAY_SECRET dan SERVICE_TO_SERVICE_SECRET wajib diatur di .env"
+        "GATEWAY_SECRET, JWT_ACCESS_SECRET, dan kredensial service wajib diatur di .env"
     );
+}
+
+function recordAudit(subject, endpoint, deviceId, decision, reason) {
+    db.prepare(`
+        INSERT INTO audit_logs (subject, endpoint, device_id, decision, reason)
+        VALUES (?, ?, ?, ?, ?)
+    `).run(subject || "unknown", endpoint, deviceId || null, decision, reason);
+}
+
+function auditDownstream(req, decision, reason) {
+    const identity = req.user || req.service;
+    recordAudit(
+        identity?.username || identity?.id,
+        req.originalUrl.split("?")[0],
+        req.deviceId,
+        decision,
+        reason
+    );
+}
+
+function verifyServiceToken(req, res, next) {
+    const authorization = req.get("Authorization") || "";
+    if (!authorization.startsWith("Bearer ")) {
+        recordAudit("unknown-service", req.originalUrl, null, "deny", "Missing service bearer token");
+        return res.status(401).json({ error: "Service token wajib disertakan." });
+    }
+
+    try {
+        const payload = jwt.verify(authorization.slice(7), ACCESS_SECRET, {
+            algorithms: ["HS256"],
+            issuer: "zero-trust-gateway",
+            audience: "zero-trust-services"
+        });
+        if (payload.role !== "service" || payload.sub !== SERVICE_CLIENT_ID) {
+            recordAudit("unknown-service", req.originalUrl, null, "deny", "Invalid service token claims");
+            return res.status(403).json({ error: "Service token tidak diizinkan." });
+        }
+        req.service = { id: payload.sub, role: payload.role };
+        return next();
+    } catch {
+        recordAudit("unknown-service", req.originalUrl, null, "deny", "Invalid or expired service token");
+        return res.status(401).json({ error: "Service token tidak valid atau kedaluwarsa." });
+    }
+}
+
+function enforcePolicy(req, res, next) {
+    const identity = req.user || req.service;
+    const endpoint = req.originalUrl.split("?")[0];
+    const attributes = {};
+
+    if (req.method === "PUT" && /^\/nilai\/\d+$/.test(endpoint)) {
+        const grade = db.prepare(`
+            SELECT c.lecturer_id AS lecturerId
+            FROM grades g JOIN classes c ON c.id = g.class_id
+            WHERE g.id = ?
+        `).get(Number(endpoint.split("/")[2]));
+        attributes.lecturerId = grade?.lecturerId;
+    } else if (req.method === "POST" && /^\/kelas\/\d+\/finalisasi$/.test(endpoint)) {
+        const kelas = db.prepare("SELECT lecturer_id AS lecturerId FROM classes WHERE id = ?")
+            .get(Number(endpoint.split("/")[2]));
+        attributes.lecturerId = kelas?.lecturerId;
+    } else if (req.method === "GET" && /^\/transkrip\/[^/]+$/.test(endpoint)) {
+        const nim = endpoint.slice("/transkrip/".length);
+        const student = db.prepare("SELECT id FROM users WHERE nim = ? AND role = 'mahasiswa'")
+            .get(nim);
+        attributes.studentId = student?.id;
+    }
+
+    const result = evaluatePolicy({
+        method: req.method,
+        path: endpoint,
+        role: identity?.role,
+        userId: identity?.id,
+        attributes
+    });
+    recordAudit(
+        identity?.username || identity?.id,
+        endpoint,
+        req.deviceId,
+        result.allowed ? "allow" : "deny",
+        result.reason
+    );
+
+    if (!result.allowed) {
+        return res.status(result.status || 403).json({
+            error: result.status === 404 ? "Resource tidak ditemukan." : "Akses ditolak."
+        });
+    }
+    return next();
 }
 
 app.disable("x-powered-by");
@@ -37,7 +135,7 @@ app.get("/health", (req, res) => {
 app.use("/auth", authRoutes);
 
 // Endpoint pemeriksaan identitas.
-app.get("/me", verifyUser, (req, res) => {
+app.get("/me", verifyUser, enforcePolicy, (req, res) => {
     res.json({
         message: "Token dan device valid.",
         user: req.user
@@ -54,12 +152,19 @@ const nilaiProxy = createProxyMiddleware({
     pathRewrite: (path, req) => req.originalUrl,
 
     on: {
+        proxyRes: (proxyRes, req) => {
+            if (proxyRes.statusCode >= 400) {
+                auditDownstream(
+                    req,
+                    "deny",
+                    `Service Nilai rejected request (HTTP ${proxyRes.statusCode})`
+                );
+            }
+        },
+
         proxyReq: (proxyReq, req) => {
             // Gateway selalu mengganti secret dari sisi client.
-            proxyReq.setHeader(
-                "X-Gateway-Secret",
-                GATEWAY_SECRET
-            );
+            proxyReq.setHeader("X-Gateway-Secret", GATEWAY_SECRET);
 
             // Meneruskan body JSON yang sudah dibaca Express.
             fixRequestBody(proxyReq, req);
@@ -67,6 +172,7 @@ const nilaiProxy = createProxyMiddleware({
 
         error: (err, req, res) => {
             console.error("Proxy Service Nilai gagal:", err.message);
+            auditDownstream(req, "deny", "Service Nilai unavailable");
 
             if (!res.headersSent) {
                 res.status(502).json({
@@ -84,16 +190,24 @@ const transkripProxy = createProxyMiddleware({
     pathRewrite: (path, req) => req.originalUrl,
 
     on: {
+        proxyRes: (proxyRes, req) => {
+            if (proxyRes.statusCode >= 400) {
+                auditDownstream(
+                    req,
+                    "deny",
+                    `Service Transkrip rejected request (HTTP ${proxyRes.statusCode})`
+                );
+            }
+        },
+
         proxyReq: (proxyReq, req) => {
-            proxyReq.setHeader(
-                "X-Gateway-Secret",
-                GATEWAY_SECRET
-            );
+            proxyReq.setHeader("X-Gateway-Secret", GATEWAY_SECRET);
 
             fixRequestBody(proxyReq, req);
         },
 
         error: (err, req, res) => {
+            auditDownstream(req, "deny", "Service Transkrip unavailable");
             console.error(
                 "Proxy Service Transkrip gagal:",
                 err.message
@@ -112,64 +226,28 @@ const transkripProxy = createProxyMiddleware({
 app.use(
     ["/nilai", "/kelas"],
     verifyUser,
+    enforcePolicy,
     nilaiProxy
 );
 
-app.use(
-    "/transkrip",
+app.get(
+    "/transkrip/:nim",
     verifyUser,
+    enforcePolicy,
     transkripProxy
 );
 
-
-app.post("/internal/transkrip/sync", async (req, res) => {
-    const supplied = req.get("X-Service-Secret") || "";
-    const expected = SERVICE_TO_SERVICE_SECRET;
-
-    const suppliedBuffer = Buffer.from(supplied);
-    const expectedBuffer = Buffer.from(expected);
-
-    if (
-        suppliedBuffer.length !== expectedBuffer.length ||
-        !crypto.timingSafeEqual(suppliedBuffer, expectedBuffer)
-    ) {
-        return res.status(403).json({
-            error: "Autentikasi antarlayanan gagal."
-        });
-    }
-
-    try {
-        const response = await fetch(
-            "http://127.0.0.1:3002/internal/sync",
-            {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "X-Gateway-Secret": GATEWAY_SECRET,
-                    "X-Service-Secret": SERVICE_TO_SERVICE_SECRET
-                },
-                body: JSON.stringify(req.body || {}),
-                signal: AbortSignal.timeout(5000)
-            }
-        );
-
-        const result = await response.json().catch(() => ({}));
-
-        return res.status(response.status).json(result);
-    } catch (err) {
-        console.error(
-            "Proxy sinkronisasi transkrip gagal:",
-            err.message
-        );
-
-        return res.status(502).json({
-            error: "Service Transkrip tidak dapat dihubungi."
-        });
-    }
-});
+app.post("/transkrip/sinkron", verifyServiceToken, enforcePolicy, transkripProxy);
 
 
 app.use((req, res) => {
+    recordAudit(
+        "unknown",
+        req.originalUrl,
+        req.get("X-Device-ID"),
+        "deny",
+        "No matching gateway route"
+    );
     res.status(404).json({
         error: "Endpoint tidak ditemukan."
     });

@@ -21,9 +21,9 @@ function verifyUser(req, res, next) {
     const authorization = req.get("Authorization");
     const deviceId = req.get("X-Device-ID");
 
-    const deny = (status, reason) => {
+    const deny = (status, reason, subject = "unknown") => {
         audit(
-            "unknown",
+            subject,
             req.originalUrl,
             deviceId,
             "deny",
@@ -43,6 +43,7 @@ function verifyUser(req, res, next) {
 
     if (!ACCESS_SECRET) {
         console.error("JWT_ACCESS_SECRET belum dikonfigurasi.");
+        audit("unknown", req.originalUrl, deviceId, "deny", "Access token verification is not configured");
         return res.status(500).json({
             error: "Konfigurasi autentikasi server bermasalah."
         });
@@ -82,7 +83,11 @@ function verifyUser(req, res, next) {
   `).get(Number(payload.sub));
 
     if (!user || user.role !== payload.role) {
-        return deny(401, "User not found or role changed");
+        return deny(401, "User not found or role changed", user?.username);
+    }
+
+    if (!deviceId) {
+        return deny(403, "Missing device ID", user.username);
     }
 
     const device = db.prepare(`

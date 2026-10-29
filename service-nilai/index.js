@@ -12,24 +12,49 @@ app.use(express.json({ limit: "100kb" }));
 
 const ACCESS_SECRET = process.env.JWT_ACCESS_SECRET;
 const GATEWAY_SECRET = process.env.GATEWAY_SECRET;
-const SERVICE_TO_SERVICE_SECRET =
-    process.env.SERVICE_TO_SERVICE_SECRET;
+const SERVICE_CLIENT_ID = process.env.SERVICE_CLIENT_ID || "service-nilai";
+const SERVICE_CLIENT_SECRET =
+    process.env.SERVICE_CLIENT_SECRET || process.env.SERVICE_TO_SERVICE_SECRET;
+const ACCESS_HOURS_START = process.env.ACCESS_HOURS_START || "07:00";
+const ACCESS_HOURS_END = process.env.ACCESS_HOURS_END || "21:00";
+const ACCESS_TIME_ZONE = process.env.ACCESS_TIME_ZONE || "Asia/Jakarta";
 
-if (!ACCESS_SECRET || !GATEWAY_SECRET || !SERVICE_TO_SERVICE_SECRET) {
-    throw new Error("JWT_ACCESS_SECRET, GATEWAY_SECRET, dan SERVICE_TO_SERVICE_SECRET wajib diatur.");
+if (
+    !ACCESS_SECRET ||
+    !GATEWAY_SECRET ||
+    !SERVICE_CLIENT_SECRET ||
+    SERVICE_CLIENT_SECRET.trim().toLowerCase().startsWith("ganti_dengan_")
+) {
+    throw new Error("JWT_ACCESS_SECRET, GATEWAY_SECRET, dan kredensial service wajib diatur.");
 }
+
+function parseClock(value) {
+    const match = /^(\d{2}):(\d{2})$/.exec(value);
+    if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) {
+        throw new Error("ACCESS_HOURS_START/END harus memakai format HH:mm.");
+    }
+    return Number(match[1]) * 60 + Number(match[2]);
+}
+
+const ACCESS_START_MINUTES = parseClock(ACCESS_HOURS_START);
+const ACCESS_END_MINUTES = parseClock(ACCESS_HOURS_END);
+if (ACCESS_START_MINUTES >= ACCESS_END_MINUTES) {
+    throw new Error("ACCESS_HOURS_START harus lebih awal dari ACCESS_HOURS_END.");
+}
+new Intl.DateTimeFormat("en-GB", { timeZone: ACCESS_TIME_ZONE }).format(new Date());
 
 // Verifikasi ulang di sisi service.
 function verifyGatewayAndToken(req, res, next) {
     const gatewaySecret = req.get("X-Gateway-Secret");
     const authorization = req.get("Authorization");
 
+    const suppliedGatewaySecret = Buffer.from(gatewaySecret || "");
+    const expectedGatewaySecret = Buffer.from(GATEWAY_SECRET);
     if (
-        !gatewaySecret ||
-        gatewaySecret.length !== GATEWAY_SECRET.length ||
+        suppliedGatewaySecret.length !== expectedGatewaySecret.length ||
         !require("node:crypto").timingSafeEqual(
-            Buffer.from(gatewaySecret),
-            Buffer.from(GATEWAY_SECRET)
+            suppliedGatewaySecret,
+            expectedGatewaySecret
         )
     ) {
         return res.status(403).json({
@@ -68,7 +93,20 @@ function verifyGatewayAndToken(req, res, next) {
             });
         }
 
+        const deviceId = req.get("X-Device-ID");
+        if (!deviceId) {
+            return res.status(403).json({ error: "X-Device-ID wajib disertakan." });
+        }
+        const device = db.prepare(`
+            SELECT 1 FROM devices
+            WHERE user_id = ? AND device_id = ? AND is_active = 1
+        `).get(user.id, deviceId);
+        if (!device) {
+            return res.status(403).json({ error: "Device tidak terdaftar atau tidak aktif." });
+        }
+
         req.user = user;
+        req.deviceId = deviceId;
         next();
     } catch {
         return res.status(401).json({
@@ -77,27 +115,45 @@ function verifyGatewayAndToken(req, res, next) {
     }
 }
 
-// Memastikan perubahan/finalisasi hanya pukul 07.00–21.00.
-// Zona waktu mengikuti konfigurasi TZ proses server.
+// Jam akses memakai batas dan zona waktu yang dikonfigurasi.
 function withinAccessHours() {
-    const hour = new Date().getHours();
-    return hour >= 7 && hour < 21;
+    const parts = new Intl.DateTimeFormat("en-GB", {
+        timeZone: ACCESS_TIME_ZONE,
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23"
+    }).formatToParts(new Date());
+    const hour = Number(parts.find(part => part.type === "hour").value);
+    const minute = Number(parts.find(part => part.type === "minute").value);
+    const currentMinutes = hour * 60 + minute;
+    return currentMinutes >= ACCESS_START_MINUTES && currentMinutes < ACCESS_END_MINUTES;
 }
 
 
 async function syncTranskrip(classId) {
-    const response = await fetch(
-        "http://127.0.0.1:3000/internal/transkrip/sync",
-        {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "X-Service-Secret": SERVICE_TO_SERVICE_SECRET
-            },
-            body: JSON.stringify({ classId }),
-            signal: AbortSignal.timeout(5000)
-        }
-    );
+    const tokenResponse = await fetch("http://127.0.0.1:3000/auth/service", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            clientId: SERVICE_CLIENT_ID,
+            clientSecret: SERVICE_CLIENT_SECRET
+        }),
+        signal: AbortSignal.timeout(5000)
+    });
+    const tokenResult = await tokenResponse.json().catch(() => ({}));
+    if (!tokenResponse.ok || !tokenResult.token) {
+        throw new Error(tokenResult.error || `Service token gagal (${tokenResponse.status})`);
+    }
+
+    const response = await fetch("http://127.0.0.1:3000/transkrip/sinkron", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${tokenResult.token}`
+        },
+        body: JSON.stringify({ classId }),
+        signal: AbortSignal.timeout(5000)
+    });
 
     const result = await response.json().catch(() => ({}));
 

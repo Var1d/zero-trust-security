@@ -8,6 +8,9 @@ const router = express.Router();
 
 const ACCESS_SECRET = process.env.JWT_ACCESS_SECRET;
 const REFRESH_SECRET = process.env.JWT_REFRESH_SECRET;
+const SERVICE_CLIENT_ID = process.env.SERVICE_CLIENT_ID || "service-nilai";
+const SERVICE_CLIENT_SECRET =
+    process.env.SERVICE_CLIENT_SECRET || process.env.SERVICE_TO_SERVICE_SECRET;
 
 if (!ACCESS_SECRET || !REFRESH_SECRET) {
     throw new Error("JWT secrets belum dikonfigurasi di .env");
@@ -18,6 +21,14 @@ const REFRESH_TTL_MS = 24 * 60 * 60 * 1000;
 
 function hashToken(token) {
     return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+function safeEqual(left, right) {
+    if (typeof left !== "string" || typeof right !== "string") return false;
+    const leftBuffer = Buffer.from(left);
+    const rightBuffer = Buffer.from(right);
+    return leftBuffer.length === rightBuffer.length &&
+        crypto.timingSafeEqual(leftBuffer, rightBuffer);
 }
 
 function issueAccessToken(user) {
@@ -131,9 +142,9 @@ router.post("/login", (req, res) => {
     const expiresAt = new Date(Date.now() + REFRESH_TTL_MS).toISOString();
 
     db.prepare(`
-    INSERT INTO refresh_tokens (user_id, token_hash, expires_at)
-    VALUES (?, ?, ?)
-  `).run(user.id, hashToken(refreshToken), expiresAt);
+    INSERT INTO refresh_tokens (user_id, device_id, token_hash, expires_at)
+    VALUES (?, ?, ?, ?)
+  `).run(user.id, deviceId, hashToken(refreshToken), expiresAt);
 
     recordAudit(
         user.username,
@@ -159,6 +170,47 @@ router.post("/login", (req, res) => {
     });
 });
 
+// POST /auth/service
+router.post("/service", (req, res) => {
+    const { clientId, clientSecret } = req.body || {};
+    const valid = SERVICE_CLIENT_SECRET &&
+        safeEqual(clientId, SERVICE_CLIENT_ID) &&
+        safeEqual(clientSecret, SERVICE_CLIENT_SECRET);
+
+    if (!valid) {
+        recordAudit(
+            "unknown-service",
+            "/auth/service",
+            null,
+            "deny",
+            "Invalid service client credentials"
+        );
+        return res.status(401).json({ error: "Kredensial service tidak valid." });
+    }
+
+    const token = jwt.sign(
+        { role: "service" },
+        ACCESS_SECRET,
+        {
+            subject: SERVICE_CLIENT_ID,
+            issuer: "zero-trust-gateway",
+            audience: "zero-trust-services",
+            expiresIn: "5m",
+            algorithm: "HS256"
+        }
+    );
+
+    recordAudit(
+        SERVICE_CLIENT_ID,
+        "/auth/service",
+        null,
+        "allow",
+        "Service token issued"
+    );
+
+    return res.json({ token, tokenType: "Bearer", expiresIn: 300 });
+});
+
 // POST /auth/refresh
 router.post("/refresh", (req, res) => {
     const { refreshToken } = req.body || {};
@@ -169,6 +221,13 @@ router.post("/refresh", (req, res) => {
         !refreshToken ||
         !deviceId
     ) {
+        recordAudit(
+            "unknown",
+            "/auth/refresh",
+            deviceId,
+            "deny",
+            "Missing refresh token or device ID"
+        );
         return res.status(400).json({
             error: "Refresh token dan X-Device-ID wajib diisi.",
         });
@@ -177,7 +236,7 @@ router.post("/refresh", (req, res) => {
     const tokenHash = hashToken(refreshToken);
 
     const saved = db.prepare(`
-    SELECT rt.id, rt.user_id, rt.expires_at, u.username, u.role
+    SELECT rt.id, rt.user_id, rt.device_id, rt.expires_at, u.username, u.role
     FROM refresh_tokens rt
     JOIN users u ON u.id = rt.user_id
     WHERE rt.token_hash = ?
@@ -212,6 +271,19 @@ router.post("/refresh", (req, res) => {
         });
     }
 
+    if (saved.device_id && saved.device_id !== deviceId) {
+        recordAudit(
+            saved.username,
+            "/auth/refresh",
+            deviceId,
+            "deny",
+            "Refresh token belongs to another device"
+        );
+        return res.status(403).json({
+            error: "Refresh token tidak terikat ke device ini."
+        });
+    }
+
     const newRefreshToken = issueRefreshToken();
     const newExpiresAt = new Date(
         Date.now() + REFRESH_TTL_MS
@@ -221,19 +293,20 @@ router.post("/refresh", (req, res) => {
     const rotate = db.transaction(() => {
         const result = db.prepare(`
       UPDATE refresh_tokens
-      SET revoked_at = CURRENT_TIMESTAMP
+      SET device_id = COALESCE(device_id, ?), revoked_at = CURRENT_TIMESTAMP
       WHERE id = ? AND revoked_at IS NULL
-    `).run(saved.id);
+    `).run(deviceId, saved.id);
 
         if (result.changes !== 1) {
             return false;
         }
 
         db.prepare(`
-      INSERT INTO refresh_tokens (user_id, token_hash, expires_at)
-      VALUES (?, ?, ?)
+      INSERT INTO refresh_tokens (user_id, device_id, token_hash, expires_at)
+      VALUES (?, ?, ?, ?)
     `).run(
             saved.user_id,
+            deviceId,
             hashToken(newRefreshToken),
             newExpiresAt
         );
@@ -242,6 +315,13 @@ router.post("/refresh", (req, res) => {
     });
 
     if (!rotate()) {
+        recordAudit(
+            saved.username,
+            "/auth/refresh",
+            deviceId,
+            "deny",
+            "Refresh token was concurrently used or revoked"
+        );
         return res.status(401).json({
             error: "Refresh token sudah digunakan atau dicabut.",
         });
@@ -274,16 +354,23 @@ router.post("/logout", (req, res) => {
     const { refreshToken } = req.body || {};
     const deviceId = req.get("X-Device-ID");
 
-    if (typeof refreshToken !== "string" || !refreshToken) {
+    if (typeof refreshToken !== "string" || !refreshToken || !deviceId) {
+        recordAudit(
+            "unknown",
+            "/auth/logout",
+            deviceId,
+            "deny",
+            "Missing refresh token or device ID"
+        );
         return res.status(400).json({
-            error: "Refresh token wajib diisi.",
+            error: "Refresh token dan X-Device-ID wajib diisi.",
         });
     }
 
     const tokenHash = hashToken(refreshToken);
 
     const saved = db.prepare(`
-    SELECT rt.id, u.username
+    SELECT rt.id, rt.user_id, rt.device_id, rt.expires_at, u.username
     FROM refresh_tokens rt
     JOIN users u ON u.id = rt.user_id
     WHERE rt.token_hash = ?
@@ -291,16 +378,62 @@ router.post("/logout", (req, res) => {
   `).get(tokenHash);
 
     if (!saved) {
+        recordAudit(
+            "unknown",
+            "/auth/logout",
+            deviceId,
+            "deny",
+            "Invalid or revoked refresh token"
+        );
         return res.status(401).json({
             error: "Refresh token tidak valid atau sudah dicabut.",
         });
     }
 
+    if (Date.parse(saved.expires_at) <= Date.now()) {
+        recordAudit(
+            saved.username,
+            "/auth/logout",
+            deviceId,
+            "deny",
+            "Expired refresh token"
+        );
+        return res.status(401).json({
+            error: "Refresh token tidak valid atau sudah kedaluwarsa."
+        });
+    }
+
+    if (!isRegisteredDevice(saved.user_id, deviceId)) {
+        recordAudit(
+            saved.username,
+            "/auth/logout",
+            deviceId,
+            "deny",
+            "Device not registered"
+        );
+        return res.status(403).json({
+            error: "Device tidak terdaftar atau tidak aktif."
+        });
+    }
+
+    if (saved.device_id && saved.device_id !== deviceId) {
+        recordAudit(
+            saved.username,
+            "/auth/logout",
+            deviceId,
+            "deny",
+            "Refresh token belongs to another device"
+        );
+        return res.status(403).json({
+            error: "Refresh token tidak terikat ke device ini."
+        });
+    }
+
     db.prepare(`
     UPDATE refresh_tokens
-    SET revoked_at = CURRENT_TIMESTAMP
+    SET device_id = COALESCE(device_id, ?), revoked_at = CURRENT_TIMESTAMP
     WHERE id = ? AND revoked_at IS NULL
-  `).run(saved.id);
+  `).run(deviceId, saved.id);
 
     recordAudit(
         saved.username,

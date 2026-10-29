@@ -59,7 +59,7 @@ function seedDatabase() {
     for (const account of accounts) {
         const password = process.env[account.passwordEnv];
 
-        if (!password || password.startsWith("ganti_dengan_")) {
+        if (!password || !password.trim() || password.trim().toLowerCase().startsWith("ganti_dengan_")) {
             throw new Error(
                 `Password demo belum diatur: ${account.passwordEnv}`
             );
