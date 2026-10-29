@@ -193,35 +193,7 @@ npm test
 
 Test memeriksa role, kepemilikan kelas/transkrip, dan penolakan route yang tidak cocok. Test ini tidak memulai service dan tidak mengubah database. Catatan pengujian manual Postman sebelumnya tercatat saat pengembangan, tetapi koleksi dan bukti request/response tidak disertakan di repository. Jalur runtime perlu diuji kembali setelah service dijalankan.
 
-## 11. Rencana demonstrasi (sekitar 8 menit)
 
-Rencana ini menunjukkan implementasi; jalur runtime perlu dijalankan dan diverifikasi terlebih dahulu.
 
-| Waktu | Demonstrasi | File kode |
-|---|---|---|
-| 0:00–1:00 | Tunjukkan alur Gateway → Service Nilai/Transkrip → SQLite dan konfigurasi demo | `gateway/index.js`, `database/db.js` |
-| 1:00–2:00 | Login dengan device valid, lalu tunjukkan access token 10 menit, refresh token, dan `GET /me` | `gateway/routes/auth.js`, `gateway/middleware/verify-user.js` |
-| 2:00–3:00 | Coba device yang tidak terdaftar; tunjukkan request ditolak dan audit deny | `gateway/middleware/verify-user.js` |
-| 3:00–4:00 | Tunjukkan policy role, perubahan nilai oleh dosen pengampu, serta penolakan untuk role/kelas lain | `gateway/policy.js`, `service-nilai/index.js` |
-| 4:00–5:00 | Tunjukkan batas waktu konfigurasi dan finalisasi nilai | `.env.example`, `service-nilai/index.js` |
-| 5:00–6:00 | Tunjukkan transkrip mahasiswa sendiri, penolakan NIM mahasiswa lain, dan akses admin | `gateway/policy.js`, `service-transkrip/index.js` |
-| 6:00–7:00 | Tunjukkan penerbitan service token lima menit dan sinkronisasi melalui Gateway | `gateway/routes/auth.js`, `gateway/index.js`, `service-nilai/index.js` |
-| 7:00–8:00 | Tampilkan event audit tanpa token/password/secret dan simpulkan hasil | tabel `audit_logs` |
 
-Untuk audit log, tampilkan kolom waktu, subjek, endpoint, device, keputusan, dan alasan; jangan tampilkan request body atau header autentikasi.
 
-## 12. Catatan dan batasan
-
-- Aplikasi mengikat layanan ke `127.0.0.1`; konfigurasi ini ditujukan untuk demonstrasi lokal, bukan deployment lintas mesin.
-- Batas waktu perubahan/finalisasi memakai `ACCESS_HOURS_START`, `ACCESS_HOURS_END`, dan `ACCESS_TIME_ZONE`; default-nya pukul 07.00–21.00 Asia/Jakarta.
-- Seed tidak mereset database dan tidak mengganti password akun yang sudah ada.
-- `gateway/policy.js` dipanggil gateway sebelum request diteruskan. Service juga tetap memeriksa role dan kepemilikan data.
-- Database lama mendapat migrasi aditif untuk kolom device refresh token; data tidak dihapus. Token lama diikat ke device jika user hanya memiliki satu device aktif; sesi ambigu dicabut tanpa menghapus riwayat token.
-- Seluruh service mengikat ke `127.0.0.1` untuk demonstrasi lokal.
-
-## 13. Pengembangan selanjutnya
-
-- Memeriksa dan melengkapi pengujian otomatis.
-- Melengkapi dokumentasi hasil pengujian dan diagram arsitektur.
-- Meninjau konsistensi kebijakan akses dan audit log.
-- Menyesuaikan laporan serta demonstrasi dengan rubrik tugas.
